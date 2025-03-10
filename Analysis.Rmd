@@ -1,0 +1,1234 @@
+---
+title: "Analysis"
+author: "Cesar Ramirez, Judah Anttila, Tyler Brassfield"
+date: "2024-11-26"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(tidyr)
+library(earth)
+library(glmnet)
+library(stats)
+library(Metrics)
+library(caret)
+library(car)
+library(glmnet)
+library(ggplot2)
+library(corrplot)
+library(kableExtra)
+
+btc_df <- read.csv("bitcoin_data.csv", stringsAsFactors = FALSE)
+data <- btc_df
+```
+
+# Pre-processing
+
+```{r pre-processing}
+# Pre-processing
+btc_df <- btc_df %>%
+  dplyr::mutate(
+    log_btc_monthly_price = log(btc_monthly_price),
+    sp500 = (sp500_open + sp500_high + sp500_low + sp500_close) / 4, # Open, High, Low, Close average
+    usdx = (usdx_open + usdx_high + usdx_low + usdx_close) / 4, # Open, High, Low, Close average
+    x10yr_bond = (X10yr_bond_open + X10yr_bond_high + X10yr_bond_low + X10yr_bond_close) / 4, # Open, High, Low, Close average
+    date = as.Date(paste0(date, "-01"), format = "%Y-%b-%d")
+  ) %>%
+  dplyr::select(-btc_monthly_price, -btc_open, -btc_high, -btc_low, -btc_close, -btc_volume, -sp500_open, -sp500_high, -sp500_low, -sp500_close, -usdx_open, -usdx_high, -usdx_low, -usdx_close, -X10yr_bond_open, -X10yr_bond_high, -X10yr_bond_low, -X10yr_bond_close, -date)
+
+# Keep un-scaled predictors
+btc_df_unscaled <- btc_df
+
+# Scale predictors
+btc_df <- btc_df %>% 
+    mutate(across(-log_btc_monthly_price, scale))
+
+# Reproducibility
+set.seed(123)
+
+# Sample 80% of data for training ~ 94 data points per fold
+train_indices <- sample(1:nrow(btc_df), size = floor(0.8 * nrow(btc_df)))
+train_data <- btc_df[train_indices, ]
+# Testing data is remaining 20% ~ 24 data points
+test_data <- btc_df[-train_indices, ]
+
+# Visualize
+plot(train_data$log_btc_monthly_price, 
+     pch = 16,
+     col = "black",
+     main = "Train Data",
+     xlab = "Sample",
+     ylab = "Log BTC Monthly Price")
+
+# Shuffle test data for visual effect
+shuffled_values <- sample(test_data$log_btc_monthly_price)
+plot(
+  seq_along(shuffled_values),
+  shuffled_values,
+  pch = 16,
+  col = "black",
+  main = "Test Data",
+  xlab = "Sample",
+  ylab = "Log BTC Monthly Price (Shuffled)"
+)
+```
+
+# Data Quality Report
+
+```{r data-report-pre-processing, include=FALSE}
+# Numeric only data
+dataNumeric <- data %>%
+  dplyr::select(where(is.numeric))
+
+# Create functions for calculating 1st and 3rd quartiles
+Q1 <- function(x, na.rm = TRUE) {
+      quantile(x, na.rm = na.rm)[2]
+}
+
+Q3 <- function(x, na.rm = TRUE) {
+      quantile(x, na.rm = na.rm)[4]
+}
+
+# The above functions compute the quantiles for numeric variables
+# within the data. Because the quantile() function returns a list 
+# of 5 numbers, to return the 1st and 3rd quartiles, we extract the
+# 2nd and 4th elements from the list. Additionally, we are choosing
+# to exclude missing values from the quantile calculations. 
+
+# Create a summary for our numeric variables
+
+myNumericSummary <- function(x){
+  c(length(x), n_distinct(x), sum(is.na(x)), mean(x, na.rm = TRUE),
+  min(x, na.rm = TRUE), Q1(x, na.rm = TRUE), median(x, na.rm = TRUE),
+  Q3(x, na.rm = TRUE), max(x, na.rm = TRUE), sd(x, na.rm = TRUE))
+}
+
+# Create a tibble of summary statistics for the numerical data 
+numericSummary <- dataNumeric %>%
+  dplyr::summarize(
+    across(everything(), myNumericSummary)
+  )
+
+# Create column names for clarity/tidiness
+
+numericSummary <- cbind(
+                  Statistic = c("n", "unique","missing","mean","min",
+                                "Q1","median","Q3","max","sd"),
+                  numericSummary)
+
+# Pivot the data and add computed values
+numericSummaryFinal <- numericSummary %>%
+    pivot_longer("btc_monthly_price":"X10yr_bond_pct_change", names_to ="variable", 
+                 values_to = "value") %>%
+    pivot_wider(names_from = Statistic, values_from = value) %>%
+    mutate(missing_pct = 100*missing/n,
+           unique_pct = 100*unique/n) %>%
+    dplyr::select(variable, n, missing, missing_pct, unique, unique_pct, everything())
+options(digits = 3)
+options(scipen = 99)
+numericSummaryFinal %>% kable()
+
+# Kable final form
+numericSummaryFinal_html <- kable(numericSummaryFinal, format = "html") %>%
+  kable_styling(full_width = FALSE, position = "left") %>%
+  row_spec(0, bold = TRUE, color = "black") %>%  # Header bold and black
+  row_spec(1:nrow(numericSummaryFinal), color = "black", font_size = 14)  # All rows darkened
+
+# Save the styled table as an HTML file
+save_kable(numericSummaryFinal_html, "numeric_summary.html")
+```
+
+```{r data_report}
+numericSummaryFinal_html
+```
+
+# Exploratory Data Analysis
+
+## Visualization 1 - Directional Trends
+
+```{r viz-1-pre, include=FALSE}
+# Pre-processing stuff for visualization
+btc_candlestick_df <- data %>%
+  select(
+    date, btc_high, btc_close, btc_open, btc_low, gold_price, usdx_close, usdx_open, usdx_high, usdx_low, cpi_u, sp500_open, sp500_high, sp500_low, sp500_close, X10yr_bond_close, X10yr_bond_open, X10yr_bond_high, X10yr_bond_low
+    ) %>%
+  mutate(
+    log_btc_high = log(btc_high),
+    log_btc_close = log(btc_close),
+    log_btc_open = log(btc_open),
+    log_btc_low = log(btc_low),
+    is_up = log_btc_close > log_btc_open,
+    gold = gold_price,
+    usdx = usdx_close,
+    cpi = cpi_u,
+    sp500 = sp500_close,
+    bond = X10yr_bond_close,
+    date = as.Date(paste0(date, "-01"), format = "%Y-%b-%d")
+  ) %>%
+  select(-gold_price, -usdx_close, -usdx_open, -usdx_high, -usdx_low, -cpi_u, -sp500_open, -sp500_high, -sp500_low, -sp500_close, -X10yr_bond_close, -X10yr_bond_open, -X10yr_bond_high, -X10yr_bond_low)
+
+# Calculate the scale factor and intercept to match log BTC range to the Gold range
+gold_min <- min(btc_candlestick_df$gold)
+gold_max <- max(btc_candlestick_df$gold)
+usdx_min <- min(btc_candlestick_df$usdx)
+usdx_max <- max(btc_candlestick_df$usdx)
+cpi_min <- min(btc_candlestick_df$cpi)
+cpi_max <- max(btc_candlestick_df$cpi)
+sp500_min <- min(btc_candlestick_df$sp500)
+sp500_max <- max(btc_candlestick_df$sp500)
+bond_min <- min(btc_candlestick_df$bond)
+bond_max <- max(btc_candlestick_df$bond)
+btc_min <- min(btc_candlestick_df$log_btc_close)
+btc_max <- max(btc_candlestick_df$log_btc_close)
+
+# Define scaling functions
+gold_to_btc_scale <- function(y) (y - gold_min) / (gold_max - gold_min) * (btc_max - btc_min) + btc_min
+usdx_to_btc_scale <- function(y) (y - usdx_min) / (usdx_max - usdx_min) * (btc_max - btc_min) + btc_min
+cpi_to_btc_scale <- function(y) (y - cpi_min) / (cpi_max - cpi_min) * (btc_max - btc_min) + btc_min
+sp500_to_btc_scale <- function(y) (y - sp500_min) / (sp500_max - sp500_min) * (btc_max - btc_min) + btc_min
+bond_to_btc_scale <- function(y) (y - bond_min) / (bond_max - bond_min) * (btc_max - btc_min) + btc_min
+```
+
+```{r viz-1}
+# Gold Plot
+ggplot(btc_candlestick_df, aes(x = date)) +
+  # Candlestick for Bitcoin
+  geom_linerange(aes(ymin = log_btc_low, ymax = log_btc_high), color = "black", linewidth = 0.5) +
+  geom_linerange(aes(ymin = log_btc_open, ymax = log_btc_close, color = is_up), linewidth = 1.5) +
+  scale_color_manual(values = c("TRUE" = "green", "FALSE" = "red")) +
+  
+  # Gold line scaled to match log BTC scale
+  geom_line(aes(y = gold_to_btc_scale(gold)), color = "gold", linewidth = 1) +
+  
+  # Adjust x-axis to show only year
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  
+  # Primary y-axis for Bitcoin, secondary y-axis for Gold
+  scale_y_continuous(
+    name = "Bitcoin Log Price (USD)",
+    sec.axis = sec_axis(~ (.-btc_min) / (btc_max - btc_min) * (gold_max - gold_min) + gold_min, 
+                        name = "Gold Price (USD)")
+  ) +
+
+  # Formatting
+  labs(title = "Log Bitcoin OHLC with Gold", x = "Date") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "black", size = 10),
+    axis.title = element_text(color = "black", size = 12),
+    plot.title = element_text(color = "black", size = 18, face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+
+# USDX Plot
+ggplot(btc_candlestick_df, aes(x = date)) +
+  # Candlestick for Bitcoin
+  geom_linerange(aes(ymin = log_btc_low, ymax = log_btc_high), color = "black", linewidth = 0.5) +
+  geom_linerange(aes(ymin = log_btc_open, ymax = log_btc_close, color = is_up), linewidth = 1.5) +
+  scale_color_manual(values = c("TRUE" = "green", "FALSE" = "red")) +
+  
+  # USDX line scaled to match log BTC scale
+  geom_line(aes(y = usdx_to_btc_scale(usdx)), color = "blue", linewidth = 1) +
+  
+  # Adjust x-axis to show only year
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  
+  # Primary y-axis for Bitcoin, secondary y-axis for USDX
+  scale_y_continuous(
+    name = "Bitcoin Log Price (USD)",
+    sec.axis = sec_axis(~ (.-btc_min) / (btc_max - btc_min) * (usdx_max - usdx_min) + usdx_min, 
+                        name = "USDX")
+  ) +
+
+  # Formatting
+  labs(title = "Log Bitcoin OHLC with USDX", x = "Date") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "black", size = 10),
+    axis.title = element_text(color = "black", size = 12),
+    plot.title = element_text(color = "black", size = 18, face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+
+# CPI Plot
+ggplot(btc_candlestick_df, aes(x = date)) +
+  # Candlestick for Bitcoin
+  geom_linerange(aes(ymin = log_btc_low, ymax = log_btc_high), color = "black", linewidth = 0.5) +
+  geom_linerange(aes(ymin = log_btc_open, ymax = log_btc_close, color = is_up), linewidth = 1.5) +
+  scale_color_manual(values = c("TRUE" = "green", "FALSE" = "red")) +
+  
+  # CPI line scaled to match log BTC scale
+  geom_line(aes(y = cpi_to_btc_scale(cpi)), color = "orange", linewidth = 1) +
+  
+  # Adjust x-axis to show only year
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  
+  # Primary y-axis for Bitcoin, secondary y-axis for CPI
+  scale_y_continuous(
+    name = "Bitcoin Log Price (USD)",
+    sec.axis = sec_axis(~ (.-btc_min) / (btc_max - btc_min) * (cpi_max - cpi_min) + cpi_min, 
+                        name = "CPI")
+  ) +
+
+  # Formatting
+  labs(title = "Log Bitcoin OHLC with CPI", x = "Date") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "black", size = 10),
+    axis.title = element_text(color = "black", size = 12),
+    plot.title = element_text(color = "black", size = 18, face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+
+# S&P500 Plot
+ggplot(btc_candlestick_df, aes(x = date)) +
+  # Candlestick for Bitcoin
+  geom_linerange(aes(ymin = log_btc_low, ymax = log_btc_high), color = "black", linewidth = 0.5) +
+  geom_linerange(aes(ymin = log_btc_open, ymax = log_btc_close, color = is_up), linewidth = 1.5) +
+  scale_color_manual(values = c("TRUE" = "green", "FALSE" = "red")) +
+  
+  # S&P500 line scaled to match log BTC scale
+  geom_line(aes(y = sp500_to_btc_scale(sp500)), color = "brown", linewidth = 1) +
+  
+  # Adjust x-axis to show only year
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  
+  # Primary y-axis for Bitcoin, secondary y-axis for S&P500
+  scale_y_continuous(
+    name = "Bitcoin Log Price (USD)",
+    sec.axis = sec_axis(~ (.-btc_min) / (btc_max - btc_min) * (sp500_max - sp500_min) + sp500_min, 
+                        name = "S&P500 (USD)")
+  ) +
+
+  # Formatting
+  labs(title = "Log Bitcoin OHLC with S&P500", x = "Date") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "black", size = 10),
+    axis.title = element_text(color = "black", size = 12),
+    plot.title = element_text(color = "black", size = 18, face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+
+# Bond Plot
+ggplot(btc_candlestick_df, aes(x = date)) +
+  # Candlestick for Bitcoin
+  geom_linerange(aes(ymin = log_btc_low, ymax = log_btc_high), color = "black", linewidth = 0.5) +
+  geom_linerange(aes(ymin = log_btc_open, ymax = log_btc_close, color = is_up), linewidth = 1.5) +
+  scale_color_manual(values = c("TRUE" = "green", "FALSE" = "red")) +
+  
+  # Bond line scaled to match log BTC scale
+  geom_line(aes(y = bond_to_btc_scale(bond)), color = "purple", linewidth = 1) +
+  
+  # Adjust x-axis to show only year
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  
+  # Primary y-axis for Bitcoin, secondary y-axis for Bond
+  scale_y_continuous(
+    name = "Bitcoin Log Price (USD)",
+    sec.axis = sec_axis(~ (.-btc_min) / (btc_max - btc_min) * (bond_max - bond_min) + bond_min, 
+                        name = "10-Year Bond Yields (%)")
+  ) +
+
+  # Formatting
+  labs(title = "Log Bitcoin OHLC with 10-Year Bonds", x = "Date") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.background = element_rect(fill = "white", color = NA),
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "lightgrey"),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "black", size = 10),
+    axis.title = element_text(color = "black", size = 12),
+    plot.title = element_text(color = "black", size = 18, face = "bold", hjust = 0.5),
+    legend.position = "none"
+  )
+```
+
+Note: there was an outlier for 2020-Aug where the low was an order of magnitude lower than the months around it. I could not find the day this occurred, so I assumed it was an error and manually calculated btc_low by downloading daily OHLC and substituted it for the minimum of all daily btc_low's in August 2020. I assume there was some kind of flash crash or other systematic error.
+
+## Visualization 2 - Lagged Correlation Analysis
+
+```{r viz-2-pre, include=FALSE}
+lagged_correlation_df <- data %>%
+  select(
+    btc_monthly_price, tot_for_purch_us_sec, tot_for_sale_us_sec, net_tot_priv_for_purch_us_sec, net_priv_for_purch_us_treas_bond_note, net_priv_for_purch_us_gov_agcy_bond, net_priv_for_purch_us_corp_bond, net_priv_for_purch_us_equity, net_tot_gov_for_purch_us_sec, net_gov_for_purch_us_treas_bond_note, net_gov_for_purch_us_gov_agcy_bond, net_gov_for_purch_us_corp_bond, net_gov_for_purch_us_equity, tot_dom_sale_for_sec, tot_dom_purch_for_sec, net_dom_purch_for_bond, net_dom_purch_for_equity, net_for_purch_us_t_bills_custodial, tot_for_hold_us_t_bills, tot_priv_for_hold_us_t_bills, tot_gov_for_hold_us_t_bills, tot_month_change_dom_bank_liab_for_inflow, month_change_bank_liab_priv_for_inflow, month_change_bank_liab_gov_for_inflow, month_change_bank_liab_all_for_inflow
+  )
+```
+
+```{r viz-2}
+# Create a shifted version of btc_monthly_price by lag rows (2, 4, 6)
+lag <- 6
+data_shifted <- lagged_correlation_df %>%
+  mutate(btc_monthly_price = lag(btc_monthly_price, lag))
+
+# Remove rows with NA values due to shifting
+data_shifted <- data_shifted %>% drop_na()
+
+# Replace and rename shifted btc_monthly_price column for clarity
+colnames(data_shifted)[colnames(data_shifted) == "btc_monthly_price"] <- paste("Lagged BTC Price")
+
+# Calculate correlation matrix
+cor_matrix <- cor(data_shifted, use = "complete.obs")
+
+# Plot correlation matrix with a title
+corrplot::corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.5,
+  tl.col = "black",
+  tl.srt = 90,
+  mar = c(0, 0, 2, 0),
+  title = paste(lag, "Month Lagged Correlation"),
+  cex.main = 0.75
+)
+```
+
+## Visualization 3 - Relationship Between S&P 500, Bitcoin, and USDX
+
+```{r viz-3}
+ggplot(data, aes(x = log(btc_monthly_price), 
+                 y = (sp500_open + sp500_high + sp500_low + sp500_close) / 4, 
+                 size = log(btc_volume), 
+                 color = (usdx_open + usdx_high + usdx_low + usdx_close) / 4)) +
+  geom_point(alpha = 0.6) +
+  labs(title = "Bitcoin, S&P 500, and USDX: Price and Trading Volume Insights", x = "Log BTC Price", y = "S&P 500 Price", size = "Log BTC Volume",
+       color = "USDX Performance") +
+  scale_color_gradient(low = "red", high = "green") +
+  theme_minimal()
+```
+
+## Visualization 4 - Correlation Plot
+
+```{r viz-4}
+# Correlation heatmap for numerical variables
+numeric_data <- dataNumeric[, sapply(dataNumeric, is.numeric)]
+
+cor_matrix <- cor(numeric_data, use = "complete.obs")
+
+corrplot::corrplot(cor_matrix, method = "color", type = "upper", tl.cex = 0.7, tl.col = "black", main = "Correlation Heatmap")
+```
+
+## Visualization 5 - Standardized Box Plots
+
+```{r viz-5-pre-processing, include=FALSE}
+# Define the function
+create_boxplot <- function(data_for_boxplot, by_median = TRUE, xlab = "Treatment Level", ylab = "Value") {
+
+  # Gather the standardized numeric Treatment_Levels into a long format for ggplot
+  data_long <- data_for_boxplot %>%
+    pivot_longer(cols = everything(), names_to = "Treatment_Level", values_to = "Standardized_value")
+  
+  if (by_median) {
+    # Calculate medians for each Treatment_Level
+    medians <- data_long %>%
+      group_by(Treatment_Level) %>%
+      summarize(median_value = median(Standardized_value, na.rm = TRUE)) %>%
+      arrange(desc(median_value))
+    
+    # Reorder factors based on median values
+    data_long$Treatment_Level <- factor(data_long$Treatment_Level, levels = medians$Treatment_Level)
+  }
+
+  # Create the boxplot for standardized Treatment_Levels
+  ggplot(data_long, aes(x = Treatment_Level, y = Standardized_value)) + 
+    geom_boxplot() + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) + 
+    labs(title = "EDA Boxplot", 
+         x = xlab, 
+         y = ylab)
+}
+
+# standardize each of the numeric variables in the dataNumeric df
+dataNumericStandardized <- as.data.frame(scale(dataNumeric))
+```
+
+```{r viz-5}
+# Visualize box plot
+create_boxplot(dataNumericStandardized, FALSE, "Econometric", "Standardized Value")
+```
+
+# Models
+
+```{r ols}
+# Train on data
+ols_model <- lm(log_btc_monthly_price ~ ., data = train_data)
+# Determine linearly dependent variables
+alias(ols_model)
+
+# Reduce linearly dependent variables
+train_data_reduced <- subset(train_data, select = -c(tot_for_purch_us_sec , tot_for_sale_us_sec, net_priv_for_purch_us_equity, net_tot_gov_for_purch_us_sec, net_tot_priv_for_purch_us_sec, tot_dom_sale_for_sec, tot_dom_purch_for_sec, tot_gov_for_hold_us_t_bills, tot_priv_for_hold_us_t_bills, net_dom_purch_for_bond, net_dom_purch_for_equity))
+
+# Examine non-aliased variables
+ols_model <- lm(log_btc_monthly_price ~ ., data = train_data_reduced)
+
+# Reduce variables with high VIF
+train_data_reduced <- subset(train_data_reduced, select = -c(net_for_purch_dom_longterm_sec, month_change_bank_liab_gov_for_inflow, month_change_bank_liab_priv_for_inflow, cpi_u, net_for_purch_us_t_bills_custodial, net_for_purch_dom_longterm_sec, month_change_bank_liab_all_for_inflow, sp500, gold_price, net_tot_for_purch_us_sec, net_priv_for_purch_us_treas_bond_note))
+
+# Examine variables with less correlation
+ols_model <- lm(log_btc_monthly_price ~ ., data = train_data_reduced)
+
+vif(ols_model)
+
+# Removing high p-value features
+train_data_reduced <- subset(train_data_reduced, select = -c(net_priv_for_purch_us_corp_bond, net_gov_for_purch_us_equity, net_dom_purch_for_sec, tot_month_change_dom_bank_liab_for_inflow, usdx))
+
+
+# Define the control for 10-fold cross-validation
+train_control <- trainControl(method = "cv", number = 10)
+
+# Perform cross-validation
+ols_model <- train(
+  log_btc_monthly_price ~ .,
+  data = train_data_reduced,
+  method = "lm",
+  trControl = train_control
+)
+
+# Print the results
+print(ols_model)
+
+# Evaluation -----
+# Predict on test data
+predicted_test <- predict(ols_model, newdata = test_data)
+
+# Calculate R²
+test_r2 <- cor(predicted_test, test_data$log_btc_monthly_price)^2
+
+# Number of observations (n) and predictors (p)
+n <- nrow(test_data)
+p <- length(ols_model$coefficients) - 1  # Number of predictors
+
+# Calculate Adjusted R²
+adjusted_r2 <- 1 - ((1 - test_r2) * (n - 1) / (n - p - 1))
+
+# Calculate Pearson Correlation Coefficient
+pearson_corr <- cor(predicted_test, test_data$log_btc_monthly_price)
+
+# Calculate RMSE
+rmse <- sqrt(mean((test_data$log_btc_monthly_price - predicted_test)^2))
+
+# AIC
+final_model <- ols_model$finalModel
+aic <- AIC(final_model)
+
+# Display the results
+list(
+  Adjusted_R2 = adjusted_r2,
+  AIC = aic,
+  Pearson_Correlation = pearson_corr,
+  RMSE = rmse
+)
+
+# Visualization ---
+
+y_test <- test_data$log_btc_monthly_price
+
+# Combine predicted_test and y_test into a data frame
+plot_data <- data.frame(
+  Index = seq_along(y_test),
+  Prediction = as.numeric(predicted_test),
+  Testing_Data = y_test
+)
+
+# Create the line plot
+ggplot(data = plot_data, aes(x = Index)) +
+  geom_line(aes(y = Prediction, color = "Prediction"), linewidth = 1) +
+  geom_line(aes(y = Testing_Data, color = "Testing Data"), linewidth = 1) +
+  labs(
+    title = "Prediction vs Testing Data",
+    x = "Index",
+    y = "Values",
+    color = "Legend"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+
+# Extract the coefficients from the final model
+coefficients <- coef(ols_model$finalModel)
+
+# View coefficients
+print(coefficients)
+
+# Build the regression equation
+equation <- paste0("Log_BTC_Price = ", 
+                   round(coefficients[1], 4), " + ",  # Intercept
+                   paste0(
+                     round(coefficients[-1], 4),      # Coefficients
+                     " * ", names(coefficients)[-1], # Predictor names
+                     collapse = " + "
+                   ))
+print(equation)
+```
+
+```{r elastic-net}
+# Convert predictors to a matrix
+x <- as.matrix(train_data[, -which(names(train_data) == "log_btc_monthly_price")])
+
+# Response variable
+y <- train_data$log_btc_monthly_price
+
+# Perform 10-fold cross-validation for elastic net (penalize more terms i.e. LASSO)
+set.seed(123)
+cv_elastic_net <- cv.glmnet(
+  x, 
+  y, 
+  alpha = 0.9,
+  nfolds = 10 
+)
+
+# Extract the best lambda
+best_lambda <- cv_elastic_net$lambda.min
+print(best_lambda)
+
+# Refit the final elastic net model using the best lambda
+final_model <- glmnet(x, y, alpha = 0.9, lambda = best_lambda)
+
+# Coefficients of the final model
+print(coef(final_model))
+
+# Plot the cross-validation result
+plot(cv_elastic_net)
+
+# Evaluation -----
+
+# Convert test data predictors to a matrix
+x_test <- as.matrix(test_data[, -which(names(test_data) == "log_btc_monthly_price")])
+
+# Response variable in test data
+y_test <- test_data$log_btc_monthly_price
+
+# Predict on the test data using the final model
+predicted_test <- predict(final_model, newx = x_test)
+
+# Calculate R²
+test_r2 <- cor(predicted_test, y_test)^2
+
+# Calculate Adjusted R²
+n <- length(y_test)  # Number of observations in test data
+p <- sum(coef(final_model) != 0) - 1  # Number of non-zero predictors (excluding intercept)
+adjusted_r2 <- 1 - ((1 - test_r2) * (n - 1) / (n - p - 1))
+
+# Calculate RMSE
+rmse <- sqrt(mean((y_test - predicted_test)^2))
+
+# Calculate Pearson Correlation Coefficient
+pearson_corr <- cor(predicted_test, y_test)
+
+# Calculate AIC
+# AIC for elastic net isn't directly available; approximate using residuals
+residuals <- y_test - predicted_test
+sigma_squared <- mean(residuals^2)
+aic <- n * log(sigma_squared) + 2 * (p + 1)
+
+# Display number of variables (non-zero predictors)
+num_variables <- p
+
+# Print all metrics
+list(
+  Adjusted_R2 = adjusted_r2,
+  RMSE = rmse,
+  AIC = aic,
+  Pearson_Correlation = pearson_corr,
+  Num_Variables = num_variables
+)
+
+# Visualization ---
+
+# Combine predicted_test and y_test into a data frame
+plot_data <- data.frame(
+  Index = seq_along(y_test),
+  Prediction = as.numeric(predicted_test),
+  Testing_Data = y_test
+)
+
+# Create the line plot
+ggplot(data = plot_data, aes(x = Index)) +
+  geom_line(aes(y = Prediction, color = "Prediction"), linewidth = 1) +
+  geom_line(aes(y = Testing_Data, color = "Testing Data"), linewidth = 1) +
+  labs(
+    title = "Prediction vs Testing Data",
+    x = "Index",
+    y = "Values",
+    color = "Legend"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+
+
+# Extract the coefficients from the final model
+coefficients <- coef(final_model)
+
+# View coefficients
+print(coefficients)
+
+# Build the regression equation
+equation <- paste0("Log_BTC_Price = ", 
+                   round(coefficients[1], 4), " + ",  # Intercept
+                   paste0(
+                     round(coefficients[-1], 4),      # Coefficients
+                     " * ", names(coefficients)[-1], # Predictor names
+                     collapse = " + "
+                   ))
+print(equation)
+```
+
+```{r mars}
+# Reproducibility
+set.seed(123)
+# Define response column
+response <- "log_btc_monthly_price"
+
+# Define cross-validation and grid search
+train_control <- trainControl(method = "cv", number = 10)
+marsParam <- expand.grid(degree = c(1, 2, 3, 4), nprune = seq(5, 25, by = 5))
+
+# Construct model
+mars_model <- train(log_btc_monthly_price ~ ., data = train_data,
+                    method = "earth", trControl = train_control,
+                    tuneGrid = marsParam)
+
+# Construct final model
+final_mars <- mars_model$finalModel
+
+# Visualizations / Exploration of model -----
+
+plot(mars_model)
+
+print(mars_model)
+
+summary(mars_model)
+
+varImp(mars_model)
+
+plotmo(mars_model$finalModel)
+
+coef(mars_model$finalModel)
+
+# Evaluation ----
+
+# Predict data
+predicted_test <- predict(mars_model, newdata = test_data)
+
+# Extract labels
+y_test <- test_data$log_btc_monthly_price
+
+# Calculate R²
+test_r2 <- cor(predicted_test, y_test)^2
+
+# Calculate Adjusted R²
+n <- length(y_test)
+p <- length(final_mars$coefficients) - 1 # number of terms; excludes intercept
+adjusted_r2 <- 1 - ((1 - test_r2) * (n - 1) / (n - p - 1))
+
+# Calculate RMSE
+rmse <- sqrt(mean((y_test - predicted_test)^2))
+
+# Calculate Pearson Correlation Coefficient
+pearson_corr <- cor(predicted_test, y_test)
+
+# AIC for MARS models isn't directly available but can be approximated
+residuals <- y_test - predicted_test
+sigma_squared <- mean(residuals^2)
+aic <- n * log(sigma_squared) + 2 * (p + 1)
+
+# Number of Variables (non-zero predictors)
+num_variables <- 7 # from final_mars
+
+# Print all metrics
+list(
+  Adjusted_R2 = adjusted_r2,
+  RMSE = rmse,
+  AIC = aic,
+  Pearson_Correlation = pearson_corr,
+  Num_Variables = num_variables
+)
+
+# Visualization ----
+
+# Combine predicted_test and y_test into a data frame
+plot_data <- data.frame(
+  Index = seq_along(y_test),
+  Prediction = as.numeric(predicted_test),
+  Testing_Data = y_test
+)
+
+# Create the line plot
+  ggplot(data = plot_data, aes(x = Index)) +
+    geom_line(aes(y = Prediction, color = "Prediction"), linewidth = 1) +
+  geom_line(aes(y = Testing_Data, color = "Testing Data"), linewidth = 1) +
+  labs(
+    title = "Prediction vs Testing Data",
+    x = "Index",
+    y = "Values",
+    color = "Legend"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+# MARS Visualizations
+
+```{r mars-viz-1}
+# Extract the relevant sp500 range from train_data
+sp500_values <- seq(min(train_data$sp500), max(train_data$sp500), length.out = 100)
+
+# Use the coefficients from your MARS model
+log_btc_price <- 9.0558 +
+  0.9414 * pmax(sp500_values - 0.532293, 0) +
+  -5.2495 * pmax(-0.532293 - sp500_values, 0)
+
+# Combine into a data frame
+df <- data.frame(sp500 = sp500_values, LogBTC = log_btc_price)
+
+# Create the plot
+ggplot(df, aes(x = sp500, y = LogBTC)) +
+  geom_line(color = "blue", size = 1.2) +
+  geom_vline(xintercept = c(-0.532293, 0.532293), linetype = "dashed", color = "red") +
+  annotate("text", x = -0.532293, y = max(log_btc_price) - 1, label = "Knot: -0.532", color = "red", hjust = -0.1, vjust=4.5) +
+  annotate("text", x = 0.532293, y = max(log_btc_price) - 1, label = "Knot: 0.532", color = "red", hjust = -0.1, vjust=4.5) +
+  labs(
+    title = "Marginal Effect of S&P 500 on Log Bitcoin Price",
+    x = "Scaled S&P 500",
+    y = "Predicted Log Bitcoin Price"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold", hjust=0.5)
+  )
+```
+
+```{r mars-viz-2}
+# Generate data
+gold_price <- seq(0, 1, length.out = 100)  # Example range for gold price
+sp500 <- seq(-1, 1, length.out = 100)     # Example range for sp500
+grid <- expand.grid(gold_price = gold_price, sp500 = sp500)
+
+# Compute the Interaction Effect
+grid$Interaction <- -1.8353167 * 
+                     pmax(0.336638 - grid$gold_price, 0) * 
+                     pmax(grid$sp500 - -0.532293, 0)
+
+
+
+# Generate the range of gold_price and sp500 based on train_data
+gold_price_range <- seq(min(train_data$gold_price), max(train_data$gold_price), length.out = 100)
+sp500_range <- seq(min(train_data$sp500), max(train_data$sp500), length.out = 100)
+
+# Create a grid of all combinations
+grid <- expand.grid(gold_price = gold_price_range, sp500 = sp500_range)
+
+# Compute the interaction effect using the coefficients
+grid$Interaction <- -1.8353167 *
+  pmax(0.336638 - grid$gold_price, 0) *
+  pmax(grid$sp500 - -0.532293, 0)
+
+# Print or use grid in your visualization
+print(head(grid))  # Check the first few rows of the data frame
+
+# Filter the grid data to only include gold_price <= 1 for visual
+filtered_grid <- grid[grid$gold_price <= 1, ]
+
+# Create the plot
+ggplot(filtered_grid, aes(x = gold_price, y = sp500, fill = Interaction)) +
+  geom_tile() +
+  labs(
+    title = "Interaction Effect of Gold and S&P 500 on Bitcoin",
+    x = "Scaled Gold Price",
+    y = "Scaled S&P 500",
+    fill = "Effect"
+  ) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+# This is the complete, zoomed out plot
+ggplot(grid, aes(x = gold_price, y = sp500, fill = Interaction)) +
+  geom_tile() +
+  labs(
+    title = "Interaction Effect of Gold and S&P 500 on Bitcoin",
+    x = "Scaled Gold Price",
+    y = "Scaled S&P 500",
+    fill = "Effect"
+  ) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust=0.5)
+  )
+```
+
+# Residual Analysis
+
+## Train data
+```{r, residual-train-pre-processing}
+
+# Assuming mars_model is trained using `caret`
+final_mars_model <- mars_model$finalModel
+
+# Get the residuals from the final model
+residuals <- residuals(final_mars_model)
+
+# Create a data frame with residuals and fitted values
+residuals_data <- data.frame(
+  Fitted_Values = fitted(final_mars_model),
+  Residuals = residuals
+)
+
+# Check for outliers using car::outlierTest (this works with lm objects, for example)
+# Since we're working with a MARS model, we need a custom method
+# You might use another approach, such as identifying large residuals manually
+
+# Here’s a basic approach to identify potential outliers manually:
+potential_outliers <- which(abs(residuals) > 2 * sd(residuals))
+
+# Print potential outliers
+potential_outliers
+nrow(residuals) # there are 94 residuals
+
+```
+
+## Test
+```{r residual-test-pre-processing}
+
+# Assuming mars_model is trained using `caret`
+final_mars_model <- mars_model$finalModel
+
+# Predict using the testing data
+predicted_test <- predict(final_mars_model, newdata = test_data)
+
+# Calculate residuals based on the testing data
+y_test <- test_data$log_btc_monthly_price
+residuals <- y_test - predicted_test
+
+# Create a data frame with residuals and fitted values (predicted values in this case)
+residuals_data <- data.frame(
+  Fitted_Values = predicted_test,
+  Residuals = residuals
+)
+
+# Check for potential outliers manually
+potential_outliers <- which(abs(residuals) > 2 * sd(residuals))
+
+# Print potential outliers
+print(potential_outliers)
+
+# Verify the number of residuals
+print(length(residuals)) # Should match the number of observations in the test set
+
+```
+
+18 represents the 18th row 
+
+highlight that point on the residuals plot
+```{r residual-pre-processing}
+
+
+# Assuming mars_model is trained using `caret`
+final_mars_model <- mars_model$finalModel
+
+# Predict using the testing data
+predicted_test <- predict(final_mars_model, newdata = test_data)
+
+# Calculate residuals based on the testing data
+y_test <- test_data$log_btc_monthly_price
+residuals <- y_test - predicted_test
+
+# Identify the specific potential outlier
+potential_outlier_index <- 18
+potential_outlier_value <- residuals[potential_outlier_index]
+
+# Leverage values should be computed for the test data
+hat_values <- hatvalues(final_mars_model)[1:length(predicted_test)]
+
+# Ensure the lengths of residuals and hat_values match
+if (length(hat_values) != length(residuals)) {
+  hat_values <- hat_values[1:length(residuals)]
+}
+
+potential_outlier_leverage <- hat_values[potential_outlier_index]
+
+# Create a data frame with residuals and fitted values (predicted values in this case)
+residuals_data <- data.frame(
+  Fitted_Values = predicted_test,
+  Residuals = residuals
+)
+
+# Check for potential outliers manually
+potential_outliers <- which(abs(residuals) > 2 * sd(residuals))
+
+# Print potential outliers
+print(potential_outliers)
+
+# Verify the number of residuals
+print(length(residuals)) # Should match the number of observations in the test set (24)
+
+# Create a data frame for plotting
+diagnostic_data <- data.frame(
+  Residuals = as.numeric(residuals), # Ensure Residuals are numeric
+  Leverage = hat_values # Ensure same length
+)
+
+# Verify the data frame
+print(head(diagnostic_data))
+
+# Create the Residuals vs. Leverage plot with the highlighted outlier
+ggplot(diagnostic_data, aes(x = Leverage, y = Residuals)) +
+  geom_point(aes(size = abs(Residuals), color = abs(Residuals)), alpha = 0.7) +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "solid", color = "red", linewidth = 1) +
+  geom_text(aes(x = potential_outlier_leverage, y = potential_outlier_value, label = "Outlier"), 
+            color = "red", vjust = -1, fontface = "bold") +
+  scale_size_continuous(range = c(1, 5)) +
+  scale_color_gradient2(low = "blue", mid = "green", high = "red", midpoint = median(abs(residuals))) +
+  labs(
+    title = "Residuals vs. Leverage Plot",
+    x = "Leverage",
+    y = "Residuals",
+    size = "Absolute Residuals",
+    color = "Absolute Residuals"
+  ) +
+  theme_bw() +  # Use a white background for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    legend.position = "bottom"
+  )
+
+
+```
+
+
+## Residuals Plot
+```{r residual-plot}
+
+# Reproducibility
+set.seed(123)
+
+# Assuming `train_data` and `test_data` are already loaded in your workspace
+# Define response column
+response <- "log_btc_monthly_price"
+
+# Define cross-validation and grid search
+train_control <- trainControl(method = "cv", number = 10)
+marsParam <- expand.grid(degree = c(1, 2, 3, 4), nprune = seq(5, 25, by = 5))
+
+# Construct model
+mars_model <- train(log_btc_monthly_price ~ ., data = train_data,
+                    method = "earth", trControl = train_control,
+                    tuneGrid = marsParam)
+
+# Construct final model
+final_mars <- mars_model$finalModel
+
+# Visualizations / Exploration of model -----
+plot(mars_model)
+print(mars_model)
+summary(mars_model)
+varImp(mars_model)
+plotmo(mars_model$finalModel)
+coef(mars_model$finalModel)
+
+# Evaluation ----
+
+# Predict data
+predicted_test <- predict(mars_model, newdata = test_data)
+
+# Extract labels
+y_test <- test_data$log_btc_monthly_price
+
+# Calculate R²
+test_r2 <- cor(predicted_test, y_test)^2
+
+# Calculate Adjusted R²
+n <- length(y_test)
+p <- length(final_mars$coefficients) - 1 # number of terms; excludes intercept
+adjusted_r2 <- 1 - ((1 - test_r2) * (n - 1) / (n - p - 1))
+
+# Calculate RMSE
+rmse <- sqrt(mean((y_test - predicted_test)^2))
+
+# Calculate Pearson Correlation Coefficient
+pearson_corr <- cor(predicted_test, y_test)
+
+# AIC for MARS models isn't directly available but can be approximated
+residuals <- y_test - predicted_test
+sigma_squared <- mean(residuals^2)
+aic <- n * log(sigma_squared) + 2 * (p + 1)
+
+# Number of Variables (non-zero predictors)
+num_variables <- 7 # from final_mars
+
+# Print all metrics
+metrics <- list(
+  Adjusted_R2 = adjusted_r2,
+  RMSE = rmse,
+  AIC = aic,
+  Pearson_Correlation = pearson_corr,
+  Num_Variables = num_variables
+)
+
+print(metrics)
+
+# Residual Plot ----
+
+# Create a data frame for plotting
+residual_plot_data <- data.frame(
+  Fitted_Values = as.numeric(predicted_test),
+  Residuals = as.numeric(residuals)
+)
+
+# Create the innovative residual plot
+ggplot(residual_plot_data, aes(x = Fitted_Values, y = Residuals)) +
+  geom_point(aes(color = Residuals), size = 2, alpha = 0.7) +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "solid", color = "red", linewidth = 1) +
+  scale_color_gradient2(low = "blue", high = "red", mid = "green", midpoint = 0) +
+  labs(
+    title = "Residual Plot",
+    x = "Fitted Values",
+    y = "Residuals",
+    color = "Residuals"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    legend.position = "bottom"
+  ) +
+ theme_bw()
+
+```
+
+# residuals vs Leverage Plot
+```{r residual-leverage-plot}
+
+# Reproducibility
+set.seed(123)
+
+# Assuming `train_data` and `test_data` are already loaded in your workspace
+# Define response column
+response <- "log_btc_monthly_price"
+
+# Define cross-validation and grid search
+train_control <- trainControl(method = "cv", number = 10)
+marsParam <- expand.grid(degree = c(1, 2, 3, 4), nprune = seq(5, 25, by = 5))
+
+# Construct model
+mars_model <- train(log_btc_monthly_price ~ ., data = train_data,
+                    method = "earth", trControl = train_control,
+                    tuneGrid = marsParam)
+
+# Construct final model
+final_mars <- mars_model$finalModel
+
+# Visualizations / Exploration of model
+plot(mars_model)
+print(mars_model)
+summary(mars_model)
+varImp(mars_model)
+plotmo(mars_model$finalModel)
+coef(mars_model$finalModel)
+
+# Evaluation
+# Predict data
+predicted_test <- predict(mars_model, newdata = test_data)
+
+# Extract labels
+y_test <- test_data$log_btc_monthly_price
+
+# Calculate R²
+test_r2 <- cor(predicted_test, y_test)^2
+
+# Calculate Adjusted R²
+n <- length(y_test)
+p <- length(final_mars$coefficients) - 1 # number of terms; excludes intercept
+adjusted_r2 <- 1 - ((1 - test_r2) * (n - 1) / (n - p - 1))
+
+# Calculate RMSE
+rmse <- sqrt(mean((y_test - predicted_test)^2))
+
+# Calculate Pearson Correlation Coefficient
+pearson_corr <- cor(predicted_test, y_test)
+
+# AIC for MARS models isn't directly available but can be approximated
+residuals <- y_test - predicted_test
+sigma_squared <- mean(residuals^2)
+aic <- n * log(sigma_squared) + 2 * (p + 1)
+
+# Number of Variables (non-zero predictors)
+num_variables <- 7 # from final_mars
+
+# Print all metrics
+metrics <- list(
+  Adjusted_R2 = adjusted_r2,
+  RMSE = rmse,
+  AIC = aic,
+  Pearson_Correlation = pearson_corr,
+  Num_Variables = num_variables
+)
+
+print(metrics)
+
+# Residuals vs. Leverage Plot
+# Calculate leverage (hat values) using the full training data
+hat_values <- hatvalues(final_mars)
+
+# Ensure the lengths of residuals and hat_values match
+length(hat_values)
+length(residuals)
+
+# Create a data frame for plotting
+diagnostic_data <- data.frame(
+  Residuals = as.numeric(residuals), # Ensure Residuals are numeric
+  Leverage = hat_values[1:length(residuals)] # Ensure same length
+)
+
+# Verify the data frame
+print(head(diagnostic_data))
+
+# Create the innovative Residuals vs. Leverage plot
+ggplot(diagnostic_data, aes(x = Leverage, y = Residuals)) +
+  geom_point(aes(size = abs(Residuals), color = abs(Residuals)), alpha = 0.7) +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "solid", color = "red", linewidth = 1) +
+  scale_size_continuous(range = c(1, 5)) +
+  scale_color_gradient2(low = "blue", mid = "green", high = "red", midpoint = median(abs(residuals))) +
+  labs(
+    title = "Residuals vs. Leverage Plot",
+    x = "Leverage",
+    y = "Residuals",
+    size = "Absolute Residuals",
+    color = "Absolute Residuals"
+  ) +
+  theme_bw() +  # Use a white background for a clean look
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
